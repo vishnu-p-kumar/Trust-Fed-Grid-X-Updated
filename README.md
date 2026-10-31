@@ -1,1645 +1,369 @@
-# GridSentinel-AI-Powered-Electricity-Theft-Grid-Intelligence-System
+# GridSentinel / TrustFedGrid
 
-An end-to-end smart-grid analytics project built on synthetic Bengaluru smart-meter data. The system generates realistic meter readings, trains multiple machine learning models, replays a live monitoring stream through FastAPI, stores runtime state in SQLite, and serves a browser dashboard for operators.
+GridSentinel is a research and demonstration platform for smart-meter analytics. It generates synthetic Bengaluru meter readings, trains anomaly, theft-classification and demand-forecasting models, and serves a live replay through a FastAPI application and browser dashboard. The repository also contains inspector workflows and a prototype coordinator/client workflow for federated-learning experiments.
 
-> **Research prototype status:** This repository now includes an experimental, single-process federated learning simulator (FedAvg, trimmed mean, trust-weighted aggregation, and provisional HATTA). Its default fixture is generated classification data, not electricity data. It now includes experimental single-release Gaussian-noise and pairwise-mask simulation utilities, but these are not a formally accounted multi-round DP system or production secure-aggregation protocol. Research scores are not publication-ready benchmark results; see [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) and [`docs/KNOWN_LIMITATIONS.md`](docs/KNOWN_LIMITATIONS.md).
+**Treat this as a research prototype.** The default meter readings and theft labels are synthetic. CEEW data supplied for research has no verified theft labels. No score in this repository establishes real-world theft-detection accuracy, and dashboard alerts are leads for human review rather than proof of theft.
 
-Some later sections in this legacy README and `model.md` still describe earlier demo behavior and interview answers. For current implementation behavior, use `docs/ARCHITECTURE.md`, `docs/METHOD.md`, `docs/EXPERIMENTS.md`, and `docs/IMPLEMENTATION_STATUS.md`.
+The project includes prototype research utilities for robust aggregation, trust scoring, privacy accounting, masked aggregation and audit ledgers. Their presence does not mean that the application provides end-to-end differential privacy, production secure aggregation, or a distributed blockchain. Read [implementation status](docs/IMPLEMENTATION_STATUS.md), [known limitations](docs/KNOWN_LIMITATIONS.md), and [privacy notes](docs/PRIVACY.md) before interpreting results.
 
-This repository is useful for:
+## Contents
 
-- data science and machine learning coursework
-- electricity theft detection demos and prototypes
-- anomaly detection and energy wastage monitoring
-- smart-grid dashboard presentations
-- full-stack ML system demonstrations
+- [What the application does](#what-the-application-does)
+- [Architecture and data flow](#architecture-and-data-flow)
+- [Repository map](#repository-map)
+- [Prerequisites](#prerequisites)
+- [Install and run locally](#install-and-run-locally)
+- [Generate data and models](#generate-data-and-models)
+- [Configuration](#configuration)
+- [Dashboard and user workflows](#dashboard-and-user-workflows)
+- [HTTP API](#http-api)
+- [Data and generated artifacts](#data-and-generated-artifacts)
+- [Federated learning workflows](#federated-learning-workflows)
+- [Optional CEEW and SGCC research](#optional-ceew-and-sgcc-research)
+- [Docker](#docker)
+- [Tests and evaluation](#tests-and-evaluation)
+- [Limitations and security](#limitations-and-security)
+- [Further documentation](#further-documentation)
 
-## 2026-10-30 implementation update
+## What the application does
 
-This revision adds a Multi-Krum aggregation baseline, optional FedProx local optimization in the federated simulator, a conservative multi-round Gaussian RDP composition utility, and atomic federated checkpoint save/load helpers. See [the implementation update report](docs/IMPLEMENTATION_UPDATES_2026-10-30.md) for validation results and limitations. These additions do not imply production secure aggregation, distributed federation, or validated real-world Indian theft-detection performance.
+### Smart-meter analytics
 
+- Creates hourly synthetic readings for Bengaluru locations and usage profiles, including simulated weather, demand variation, and theft-like scenarios.
+- Builds meter, pole and transformer relationships for meter-level and pole-level analysis.
+- Trains an Isolation Forest anomaly detector and theft classifiers (Random Forest and XGBoost when available, with a fallback boosted classifier).
+- Produces theft probabilities, anomaly indicators, risk categories, efficiency and estimated-loss measures, pole energy-balance indicators, drift summaries and human-readable prediction explanations.
+- Trains LSTM and Transformer demand forecasters where the corresponding dependencies and model paths are available; fallback forecasting behavior is included.
+- Replays a prepared time series in the API runtime, persists operational snapshots in SQLite, and updates the dashboard on a configurable interval.
 
-## Table of Contents
+### Operator and client workflows
 
-- [1. Project Summary](#1-project-summary)
-- [2. Key Capabilities](#2-key-capabilities)
-- [3. System Architecture](#3-system-architecture)
-- [4. Repository Structure](#4-repository-structure)
-- [5. Data Generation Pipeline](#5-data-generation-pipeline)
-- [6. Dataset Schema](#6-dataset-schema)
-- [7. Modeling and Analytics](#7-modeling-and-analytics)
-- [8. Runtime and API Behavior](#8-runtime-and-api-behavior)
-- [9. Dashboard](#9-dashboard)
-- [10. Generated Artifacts](#10-generated-artifacts)
-- [11. Installation](#11-installation)
-- [12. How to Run](#12-how-to-run)
-- [13. Configuration](#13-configuration)
-- [14. Docker Support](#14-docker-support)
-- [15. API Reference](#15-api-reference)
-- [16. Testing](#16-testing)
-- [17. Project Workflow Summary](#17-project-workflow-summary)
-- [18. Troubleshooting](#18-troubleshooting)
-- [19. Presentation Summary](#19-presentation-summary)
-- [20. Detailed Model Selection Rationale](#20-detailed-model-selection-rationale)
-- [21. In-Depth Interview Questions](#21-in-depth-interview-questions)
-- [22. Federated Research Prototype](#22-federated-research-prototype)
-  - [CEEW real smart-meter dataset](#ceew-real-smart-meter-dataset)
-- [23. Roadmap improvements and evaluation tools](#23-roadmap-improvements-and-evaluation-tools)
+- Admin login and summary views, client organization management, bounded research experiment controls, and federated update/audit views.
+- Inspector accounts, area-scoped suspicious-meter views, task assignment and task completion.
+- Separate client login and dashboard for organization identity, dataset metadata, federated rounds, submitted updates and trust history.
+- A local CSV client agent that trains a binary logistic-regression model and sends model parameters and metadata to the coordinator. It does not upload raw meter rows.
 
-## 1. Project Summary
+These workflows are implemented in a primarily single-process application. They are useful for integration and research demonstrations, not a ready-made multi-utility production service.
 
-At a high level, the project does five things:
-
-1. Generates hourly synthetic smart-meter data for Bengaluru areas.
-2. Simulates electricity theft, anomalies, energy wastage, weather effects, and pole-level tampering.
-3. Trains anomaly detection, theft detection, and demand forecasting models.
-4. Replays a live simulation through a FastAPI backend that updates every few seconds.
-5. Visualizes current and historical analytics in a static dashboard.
-
-The repository is meter-centric but also includes a pole-monitoring layer. Each meter is mapped into a `transformer -> pole -> meter` hierarchy, allowing the system to detect direct pole tapping, supply mismatch, and hidden unmetered consumption in addition to meter-level suspicious behavior.
-
-## 2. Key Capabilities
-
-- Synthetic smart-meter generation across multiple Bengaluru areas
-- Weather-aware electricity consumption simulation
-- Multiple theft scenarios such as bypass, tampering, illegal connections, and abnormal spikes
-- Isolation Forest based anomaly detection
-- Random Forest plus boosted-model theft classification
-- Classifier probability blending; synthetic generator metadata is excluded from inference
-- Meter-level risk scoring and risk categories
-- Energy efficiency and wastage analytics
-- Pole energy balance monitoring and pole tamper detection
-- LSTM and Transformer-based demand forecasting with fallback behavior
-- Data drift monitoring between historical and recent windows
-- Explainable predictions for suspicious meters
-- Optional alert dispatch to email, Slack, and Telegram
-- FastAPI REST API plus WebSocket live stream
-- Multi-section static dashboard for realtime monitoring and artifact downloads
-
-## 3. System Architecture
-
-The current implementation follows this flow:
-
-1. `run_project.py` loads generation defaults from `utils/helpers.py`.
-2. `src/data_generator.py` creates:
-   - the main dataset
-   - a sampled training dataset
-   - a live simulation dataset
-   - meter and pole catalogs
-   - generation summary metadata
-3. `src/train_models.py` trains:
-   - Isolation Forest for anomaly detection
-   - Random Forest for theft detection
-   - XGBoost or a fallback boosted model for theft detection
-   - LSTM demand forecaster
-   - Transformer demand forecaster
-4. `api/main.py` boots the runtime, regenerates missing artifacts when needed, loads models and datasets, and starts a simulation loop.
-5. Each live tick is enriched with anomaly scores, theft probabilities, risk levels, efficiency metrics, pole energy balance, drift state, clustering output, and forecast output.
-6. Runtime snapshots are written into SQLite tables in `database/meter_data.db`.
-7. The dashboard reads API endpoints every few seconds and can also consume the `/ws/live` WebSocket payload.
-
-## 4. Repository Structure
-
-Important folders and files:
-
-- `api/`
-  FastAPI backend and live runtime simulation.
-
-- `src/`
-  Core Python modules for generation, preprocessing, training, forecasting, scoring, explainability, drift detection, pole monitoring, reporting, and exports.
-
-- `dashboard/`
-  Static frontend with HTML sections, shared JavaScript components, and styling.
-
-- `data/raw/`
-  Placeholder location for raw source data if the project is extended beyond synthetic generation.
-
-- `data/processed/`
-  Processed intermediate outputs such as the sample training set, live simulation data, meter catalog, pole catalog, and generation summary.
-
-- `dataset/`
-  Main generated synthetic dataset.
-
-- `models/`
-  Trained model artifacts and metadata files.
-
-- `database/`
-  SQLite runtime database generated by the API.
-
-- `reports/`
-  Generated PDF and JSON reporting artifacts.
-
-- `maps/`
-  Generated HTML heatmaps.
-
-- `sample_outputs/`
-  Example API request/response payloads.
-
-- `tests/`
-  Pytest-based tests for data generation, analytics modules, forecasting, API payloads, and runtime behavior.
-
-- `run_project.py`
-  Main bootstrap script for generation, training, exports, reports, and optional API startup.
-
-- `run.md`
-  PowerShell-oriented run guide.
-
-- `model.md`
-  High-level explanation of the models used in the project.
-
-- `docker-compose.yml`
-  Two-service stack for API and dashboard.
-
-## 5. Data Generation Pipeline
-
-The synthetic data generator is implemented in `src/data_generator.py`.
-
-### 5.1 Geographic Coverage
-
-Meters are distributed across Bengaluru locations defined in `utils/helpers.py`:
-
-- Whitefield
-- Electronic City
-- Indiranagar
-- Koramangala
-- Marathahalli
-- Yelahanka
-- BTM Layout
-- Jayanagar
-- Malleshwaram
-- Rajajinagar
-- Hebbal
-- Bellandur
-- HSR Layout
-- Banashankari
-- Peenya Industrial Area
-
-Coordinates are jittered around each area center so meters appear spatially distinct on the map while still staying inside Bengaluru bounds.
-
-### 5.2 Usage Profiles
-
-Every meter is assigned a usage profile that drives base load behavior:
-
-- `residential`
-- `night_usage`
-- `industrial`
-- `ac_heavy`
-- `commercial`
-
-These profiles influence load shape, temperature sensitivity, weekday/weekend patterns, and expected consumption.
-
-### 5.3 Weather Generation
-
-Weather is handled by `src/weather_api.py`.
-
-Behavior:
-
-- If `OPENWEATHER_API_KEY` is configured, the weather service can fetch current live weather from OpenWeather.
-- For historical generation and fallback scenarios, the project simulates Bengaluru hourly weather.
-
-Generated weather fields include:
-
-- `temperature`
-- `humidity`
-- `rainfall`
-- `wind_speed`
-- `weather_condition`
-
-### 5.4 Theft Scenarios
-
-The dataset simulates these theft patterns:
-
-- `meter_bypass`
-- `abnormal_spikes`
-- `constant_low_consumption`
-- `illegal_connection`
-- `tampered_meter`
-
-These patterns modify reported consumption, actual load, voltage, current behavior, and downstream risk signals.
-
-### 5.5 Pole Hierarchy
-
-The project extends the meter dataset with:
-
-- `transformer_id`
-- `pole_id`
-- `connected_meters`
-
-The pole hierarchy is generated automatically and stored in `data/processed/pole_catalog.csv`. This enables pole-level supply simulation and tamper detection during runtime.
-
-### 5.6 Default Generation Settings
-
-`utils/helpers.py` defines two standard configurations.
-
-Default mode:
-
-- `num_meters = 500`
-- `days = 60`
-- `chunk_size = 45`
-- `sample_rows = 45000`
-- `simulation_days = 10`
-- `simulation_meter_limit = 425`
-- `seed = 42`
-
-Full-scale mode:
-
-- `num_meters = 1000`
-- `days = 365`
-- `chunk_size = 100`
-- `sample_rows = 120000`
-- `simulation_days = 14`
-- `simulation_meter_limit = 80`
-- `seed = 42`
-
-### 5.7 Live Simulation Stability
-
-The live replay dataset intentionally behaves differently from the broader historical training data:
-
-- a deterministic subset of live meters is selected as theft candidates
-- the selected live theft meters remain stable during the live replay window
-- non-selected live meters can have random theft disabled during replay
-
-This keeps the dashboard easier to follow during presentations because the suspicious meters do not jump randomly every few seconds.
-
-## 6. Dataset Schema
-
-### 6.1 Main Generated Files
-
-The generator writes these key outputs:
-
-- `dataset/smart_meter_data.csv`
-  Full synthetic dataset.
-
-- `data/processed/smart_meter_sample.csv`
-  Sampled training-friendly dataset.
-
-- `data/processed/live_simulation.csv`
-  Dataset used by the FastAPI live runtime.
-
-- `data/processed/meter_catalog.csv`
-  Meter metadata.
-
-- `data/processed/pole_catalog.csv`
-  Pole and transformer hierarchy.
-
-- `data/processed/generation_summary.json`
-  Generation metadata and live theft meter list.
-
-### 6.2 Core Meter Columns
-
-Important source columns include:
-
-- `meter_id`
-- `timestamp`
-- `region`
-- `area`
-- `transformer_id`
-- `pole_id`
-- `connected_meters`
-- `latitude`
-- `longitude`
-- `voltage`
-- `current`
-- `power`
-- `consumption_kwh`
-- `power_factor`
-- `temperature`
-- `humidity`
-- `rainfall`
-- `wind_speed`
-- `weather_condition`
-- `is_theft`
-- `expected_consumption_kwh`
-- `wastage_score`
-- `usage_profile`
-- `theft_type`
-- `seeded_theft_probability`
-
-### 6.3 Preprocessing and Engineered Fields
-
-`src/preprocess.py` and `src/feature_engineering.py` add additional runtime and model features such as:
-
-- `wastage_flag`
-- `power_gap`
-- `temperature_band`
-- `hour_of_day`
-- `day_of_week`
-- `rolling_average_consumption`
-- `consumption_variance`
-- `peak_usage_ratio`
-- `night_usage_ratio`
-- `weather_consumption_ratio`
-- `power_factor_loss`
-- `voltage_irregularity`
-- `current_power_gap`
-
-Categorical feature groups include:
-
-- `region`
-- `area`
-- `weather_condition`
-- `usage_profile`
-
-### 6.4 Runtime-Derived Fields
-
-After live scoring, the runtime adds fields like:
-
-- `anomaly_score`
-- `is_anomaly`
-- `random_forest_probability`
-- `xgboost_probability`
-- `theft_probability`
-- `status`
-- `risk_score`
-- `risk_level`
-- `efficiency_score`
-- `estimated_losses_kwh`
-- `tamper_probability`
-- `tamper_flag`
-- `energy_gap`
-
-## 7. Modeling and Analytics
-
-### 7.1 Anomaly Detection
-
-Files:
-
-- `src/detect_anomaly.py`
-- `src/train_models.py`
-
-Model:
-
-- Isolation Forest
-
-Purpose:
-
-- detect unusual readings even when theft is not explicitly confirmed
-- produce `anomaly_score` and `is_anomaly`
-
-### 7.2 Theft Detection
-
-Files:
-
-- `src/theft_detector.py`
-- `src/train_models.py`
-
-Models:
-
-- Random Forest
-- XGBoost when available
-- `HistGradientBoostingClassifier` fallback if XGBoost is unavailable
-
-Final theft probability is calibrated using:
-
-- model probabilities
-- anomaly score
-- seeded theft probability
-- wastage score
-
-Outputs include:
-
-- `random_forest_probability`
-- `xgboost_probability`
-- `theft_probability`
-- `status`
-
-### 7.3 Risk Scoring
-
-File:
-
-- `src/risk_scoring.py`
-
-Purpose:
-
-- combine model outputs and electrical heuristics into a single risk score
-- assign `Low`, `Medium`, `High`, and `Critical` risk levels
-
-### 7.4 Energy Efficiency and Wastage
-
-File:
-
-- `src/energy_efficiency.py`
-
-Purpose:
-
-- compute efficiency metrics
-- estimate losses in kWh
-- surface low-efficiency and wastage-sensitive meters
-
-### 7.5 Pole Monitoring and Pole Tamper Detection
-
-Files:
-
-- `src/pole_monitoring.py`
-- `src/pole_tamper_detector.py`
-
-Purpose:
-
-- aggregate meter load into pole-level supply behavior
-- estimate technical losses and hidden load
-- compute energy mismatch between supplied and metered energy
-- detect suspicious poles and likely illegal connections
-
-Core idea:
-
-`supplied_energy - (meter_energy_sum + loss_estimate) = energy_gap`
-
-Large or abnormal energy gaps can trigger pole tamper alerts.
-
-### 7.6 Demand Forecasting
-
-Files:
-
-- `src/demand_forecasting.py`
-- `src/transformer_forecasting.py`
-
-Models:
-
-- LSTM forecaster
-- Transformer forecaster
-- seasonal/baseline fallback logic when deep learning dependencies or artifacts are unavailable
-
-Forecast outputs include:
-
-- `next_hour`
-- `next_day`
-- `next_week`
-- forecast `series`
-- comparison between LSTM and Transformer outputs
-
-### 7.7 Explainability
-
-File:
-
-- `src/explainable_ai.py`
-
-Methods:
-
-- SHAP when available
-- fallback feature-importance style explanations when SHAP is unavailable
-
-Purpose:
-
-- explain suspicious predictions in human-readable form
-- support theft investigation tables and API responses
-
-### 7.8 Data Drift Monitoring
-
-File:
-
-- `src/data_drift_monitor.py`
-
-Methods:
-
-- Evidently when available
-- fallback statistical drift checks otherwise
-
-Purpose:
-
-- compare recent live data to historical reference data
-- identify feature drift, data-quality issues, and theft-rate shifts
-
-### 7.9 Hyperparameter Optimization
-
-File:
-
-- `src/model_optimizer.py`
-
-Method:
-
-- Optuna
-
-Purpose:
-
-- tune anomaly and theft model parameters before training when explicitly requested from the CLI
-
-### 7.10 Reporting and Export Utilities
-
-Files:
-
-- `src/report_generator.py`
-- `src/spatial_analysis.py`
-- `src/sample_outputs.py`
-
-Outputs include:
-
-- PDF report
-- drift JSON report
-- HTML heatmap
-- example prediction and overview API payloads
-
-## 8. Runtime and API Behavior
-
-The backend lives in `api/main.py`.
-
-### 8.1 Startup Behavior
-
-On startup the runtime:
-
-1. ensures project directories exist
-2. regenerates data artifacts if key files are missing or outdated
-3. retrains models if required model artifacts are missing
-4. loads historical and live datasets
-5. initializes forecast, drift, and pole-monitoring state
-6. advances one simulation tick immediately so the dashboard has data at first load
-
-### 8.2 Live Tick Processing
-
-Every update cycle:
-
-1. the runtime selects one timestamp slice from `live_simulation.csv`
-2. meter readings are classified for anomaly and theft
-3. a visible theft candidate may be injected if none is present
-4. the first detected theft meter can be kept sticky for demo stability
-5. theft alerts are capped for readability
-6. risk and efficiency metrics are computed
-7. pole energy is simulated and checked for tampering
-8. recent windows are updated for drift monitoring
-9. forecast data is rebuilt
-10. SQLite tables are refreshed
-11. the latest snapshot is broadcast to WebSocket clients
-12. periodic reports and heatmap outputs are regenerated on schedule
-
-### 8.3 SQLite Tables
-
-The backend writes runtime data into `database/meter_data.db` using tables such as:
-
-- `meter_readings`
-- `live_predictions`
-- `recent_predictions`
-- `risk_scores`
-- `efficiency_metrics`
-- `drift_reports`
-- `forecast_snapshots`
-- `pole_energy_data`
-- `pole_tamper_events`
-
-### 8.4 Alert Integrations
-
-`src/alert_engine.py` supports optional outbound alert delivery through:
-
-- SMTP email
-- Slack webhook
-- Telegram bot API
-
-Alerts are sent only when `SMARTGRID_ENABLE_ALERTS=1`.
-
-## 9. Dashboard
-
-The frontend is a static dashboard in `dashboard/`.
-
-Main files:
-
-- `dashboard/index.html`
-- `dashboard/main.js`
-- `dashboard/style.css`
-
-Shared components:
-
-- `dashboard/components/core.js`
-- `dashboard/components/charts.js`
-- `dashboard/components/alerts.js`
-- `dashboard/components/forecast.js`
-- `dashboard/components/heatmap.js`
-
-The dashboard defaults to the API base URL `http://127.0.0.1:8000` and stores UI state such as selected section and theme in local storage.
-
-### 9.1 Dashboard Sections
-
-Each file in `dashboard/sections/` represents one analytics view:
-
-- `overview.html`
-  High-level KPIs, live demand, and system health.
-
-- `live_monitoring.html`
-  Realtime usage and meter-level monitoring.
-
-- `theft_detection.html`
-  Theft counts, suspicious meters, and investigation priorities.
-
-- `anomaly_detection.html`
-  Anomaly metrics and suspicious outlier summaries.
-
-- `demand_forecast.html`
-  LSTM and Transformer forecast comparisons.
-
-- `energy_efficiency.html`
-  Wastage and efficiency views.
-
-- `pole_monitoring.html`
-  Pole energy balance, suspicious poles, and illegal connection signals.
-
-- `heatmap.html`
-  Interactive theft hotspot map.
-
-- `weather_impact.html`
-  Demand behavior against weather conditions.
-
-- `alerts.html`
-  Consolidated alerts and operational notifications.
-
-- `reports.html`
-  Downloadable reports and sample output references.
-
-### 9.2 Refresh Pattern
-
-The dashboard polls the backend frequently and also supports the `/ws/live` WebSocket snapshot payload. The backend update interval defaults to 4 seconds and can be changed with `SMARTGRID_UPDATE_INTERVAL`.
-
-## 10. Generated Artifacts
-
-Common generated files include:
-
-- `dataset/smart_meter_data.csv`
-- `data/processed/smart_meter_sample.csv`
-- `data/processed/live_simulation.csv`
-- `data/processed/meter_catalog.csv`
-- `data/processed/pole_catalog.csv`
-- `data/processed/generation_summary.json`
-- `models/isolation_forest.pkl`
-- `models/random_forest.pkl`
-- `models/xgboost_model.pkl`
-- `models/lstm_model.h5`
-- `models/transformer_forecaster.pt`
-- `models/model_metadata.json`
-- `models/demand_metadata.json`
-- `models/transformer_metadata.json`
-- `models/optimizer_best_params.json` when optimization is used
-- `database/meter_data.db`
-- `reports/daily_energy_report.pdf`
-- `reports/drift_report.json`
-- `maps/theft_heatmap.html`
-- `dashboard/theft_heatmap.html`
-- `sample_outputs/predict_request.json`
-- `sample_outputs/predict_response.json`
-- `sample_outputs/theft_response.json`
-- `sample_outputs/overview_response.json`
-- `sample_outputs/manifest.json`
-
-## 11. Installation
-
-The repository is currently easiest to run in Windows PowerShell, and `run.md` is written with that workflow in mind.
-
-### 11.1 Python Version
-
-Use Python 3.11 if possible.
-
-Example interpreter path used on this machine:
-
-```powershell
-$PYTHON = "C:\Users\vishn\AppData\Local\Programs\Python\Python311\python.exe"
-```
-
-If `python` is already configured in your PATH, you can use `python` instead of `$PYTHON`.
-
-### 11.2 Create `.env`
-
-```powershell
-if (-not (Test-Path .env)) { Copy-Item .env.example .env }
-```
-
-### 11.3 Install Dependencies
-
-Core dependencies from `requirements.txt` include:
-
-- FastAPI
-- Uvicorn
-- pandas
-- NumPy
-- scikit-learn
-- XGBoost
-- TensorFlow
-- matplotlib
-- seaborn
-- Plotly
-- folium
-- geopandas
-- joblib
-- requests
-- websockets
-- SHAP
-- pydantic
-
-Install the main stack:
-
-```powershell
-& $PYTHON -m pip install -r requirements.txt
-```
-
-Install testing tools:
-
-```powershell
-& $PYTHON -m pip install -r requirements-test.txt
-```
-
-Optional advanced dependencies:
-
-```powershell
-& $PYTHON -m pip install -r requirements-advanced.txt
-```
-
-Advanced extras add packages such as:
-
-- Optuna
-- Evidently
-- PyTorch
-
-## 12. How to Run
-
-### 12.1 Quick Start
-
-```powershell
-cd "c:\Users\vishn\Desktop\College\SEMISTER\CSE 6th SEM\Data Science\Project 1\electricity_theft_and_anomaly_detection"
-$PYTHON = "C:\Users\vishn\AppData\Local\Programs\Python\Python311\python.exe"
-if (-not (Test-Path .env)) { Copy-Item .env.example .env }
-& $PYTHON -m pip install -r requirements.txt
-& $PYTHON -m pip install -r requirements-test.txt
-& $PYTHON run_project.py
-& $PYTHON -m pytest
-& $PYTHON -m uvicorn api.main:app --host 127.0.0.1 --port 8000
-```
-
-In a second terminal:
-
-```powershell
-cd "c:\Users\vishn\Desktop\College\SEMISTER\CSE 6th SEM\Data Science\Project 1\electricity_theft_and_anomaly_detection\dashboard"
-$PYTHON = "C:\Users\vishn\AppData\Local\Programs\Python\Python311\python.exe"
-& $PYTHON -m http.server 8080
-```
-
-Open:
+## Architecture and data flow
 
 ```text
-http://127.0.0.1:8080/index.html
+Synthetic generator or prepared data
+        │
+        ├── preprocessing and feature engineering
+        ├── anomaly detection, theft classification and forecasting
+        └── risk, efficiency, pole balance, explainability and drift analytics
+                         │
+                 FastAPI runtime (api/main.py)
+                  ├── REST API and /ws/live
+                  ├── SQLite operational snapshots and client registry
+                  └── static HTML/CSS/JavaScript dashboards
+
+Federated client CSV → local logistic training → signed parameter update
+                                               → prototype coordinator
 ```
 
-### 12.2 Bootstrap Data and Models
+The federated client and coordinator components are separate from the centralized synthetic-meter training pipeline. All coordinator code and registered clients can still run within one application/database; this is not network-isolated federation. The central coordinator can inspect submitted parameter updates.
+
+## Repository map
+
+| Path | Purpose |
+|---|---|
+| `api/main.py` | FastAPI app, authentication, runtime loop, REST/WebSocket routes, dashboard serving and orchestration. |
+| `src/` | Data generation and preprocessing, feature engineering, models, forecasting, scoring, alerts, reporting, drift, pole monitoring, investigations, security and federated research code. |
+| `src/federated/` | Synthetic experiments, partitions, aggregators, attacks, trust logic, client registry/coordinator, checkpoint and ledger helpers. |
+| `src/security/` | Privacy utilities, privacy accountant, reference secure-sum helper, TOTP and rate-limit adapter. These are not a complete production privacy/security stack. |
+| `dashboard/` | Static front end: main operator dashboard, admin pages, inspector and client portals, reports and shared components. No Node build step is required. |
+| `client_agent/` | Standalone client-side CSV training agent and its usage guide. |
+| `utils/helpers.py` | Project paths, generation defaults, serialization and SQLite helpers. |
+| `scripts/` | Dataset preparation, evaluation, experiment and validation command-line tools. |
+| `tests/` | Pytest coverage for API, data, analytics, workflows and research components. |
+| `data/raw/` | Place externally acquired raw data here; do not commit private/customer data. |
+| `data/processed/` | Generated training/live datasets and normalized research inputs. |
+| `data/labels/` | Provenance guidance and examples for externally sourced labeled data; no verified theft dataset is bundled. |
+| `dataset/` | Generated synthetic meter dataset. |
+| `models/` | Trained model files and metadata. |
+| `database/` | SQLite runtime databases and local workflow state. |
+| `reports/` and `maps/` | Generated PDF/JSON reports, experiment output and heatmaps. |
+| `sample_outputs/` | Example API request/response payloads. |
+| `docs/` | Architecture, methods, data cards, experiments, validation records, limitations and research notes. |
+| `run_project.py` | Data/model/report bootstrap command; optionally starts the API. |
+| `run.md` | Extended Windows PowerShell run guide. |
+| `docker-compose.yml` | Local API/dashboard containers plus optional production-profile infrastructure services. |
+
+## Prerequisites
+
+- Python 3.11 is the version used by the Docker image and is a good local choice.
+- Windows PowerShell commands below assume the repository root (the directory containing `run_project.py`). Other operating systems can use equivalent virtual-environment and environment-variable commands.
+- A frontend toolchain is not required; the dashboard is static HTML, CSS and JavaScript.
+- The default dataset is generated locally. Internet access and an OpenWeather key are optional; optional integrations and some model libraries may require additional packages or credentials.
+
+## Install and run locally
+
+### 1. Create an environment and install dependencies
 
 ```powershell
-& $PYTHON run_project.py
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-This command:
+If PowerShell does not allow activation, call the environment interpreter directly, for example `.\.venv\Scripts\python.exe -m pip install -r requirements.txt`, and use that interpreter for the remaining commands. Install test-only packages with `python -m pip install -r requirements-test.txt`. Install `requirements-advanced.txt` only for optional advanced workflows such as model optimization.
 
-- generates synthetic datasets
-- writes meter and pole catalogs
-- trains anomaly, theft, and forecasting models
-- exports sample outputs
-- builds the theft heatmap
-- generates the PDF report
+The requirements include substantial numerical, ML and visualization packages; installation and first model training can take time. Some forecasting/model features have fallback paths if optional model dependencies or artifacts are not available.
 
-### 12.3 Generate Data Only
+### 2. Configure local login and cookies
+
+The API loads `.env` from the repository root when it starts; variables already present in the process environment take precedence. Start from `.env.example`, then replace the example admin password and session secret with your own values. Keep `.env`, credentials, client-agent secrets and private data out of version control.
+
+For local HTTP development, set a session secret of at least 32 characters, an admin email/password, and disable secure-only cookies. For example, in PowerShell:
 
 ```powershell
-& $PYTHON run_project.py --skip-training
+$env:SMARTGRID_ADMIN_EMAIL = "admin@example.test"
+$env:SMARTGRID_ADMIN_PASSWORD = "choose-a-local-password"
+$env:SMARTGRID_SESSION_SECRET = (python -c "import secrets; print(secrets.token_urlsafe(48))")
+$env:SMARTGRID_COOKIE_SECURE = "0"
+$env:SMARTGRID_CORS_ORIGINS = "http://127.0.0.1:8000,http://localhost:8000"
 ```
 
-### 12.4 Useful CLI Options
+Use the same PowerShell window to start the API so the variables are inherited. `SMARTGRID_COOKIE_SECURE=0` is only for local HTTP development; use HTTPS and secure cookies for a deployed service. Inspector accounts and federated client accounts are created through their respective admin workflows.
 
-`run_project.py` currently supports:
+### 3. Generate data and models
 
-- `--full-scale`
-  Generate the 1000-meter, 365-day configuration.
-
-- `--num-meters`
-  Override the number of meters.
-
-- `--days`
-  Override the number of simulation days.
-
-- `--skip-training`
-  Generate data without model training.
-
-- `--forecast-epochs`
-  Set LSTM training epochs.
-
-- `--skip-sample-export`
-  Skip writing example API payloads.
-
-- `--skip-report`
-  Skip generating the PDF report.
-
-- `--start-api`
-  Start FastAPI immediately after bootstrapping.
-
-- `--optimize-models`
-  Run Optuna-based optimization before training.
-
-- `--optimization-trials`
-  Set the number of Optuna trials.
-
-### 12.5 Start the API Manually
+For the default demonstration configuration (500 meters, 60 days):
 
 ```powershell
-& $PYTHON -m uvicorn api.main:app --host 127.0.0.1 --port 8000
+python run_project.py
 ```
 
-Health check:
+For a smaller pipeline smoke run:
 
 ```powershell
-Invoke-WebRequest http://127.0.0.1:8000/health -UseBasicParsing
+python run_project.py --num-meters 20 --days 7 --forecast-epochs 1 --skip-report --skip-sample-export
 ```
 
-### 12.6 Demo Mode
+The generator writes the synthetic dataset, processed training/live data and catalogs. Unless `--skip-training` is supplied, the command trains detection and forecasting models, builds the heatmap and may write report/sample artifacts. The quick run is for checking the pipeline; its scores are synthetic and are not evidence of real-world performance.
 
-To reduce periodic report generation during a demo:
+Common options:
+
+| Option | Effect |
+|---|---|
+| `--num-meters N` | Override generated meter count. |
+| `--days N` | Override simulated history length. |
+| `--full-scale` | Select the larger 1,000-meter, 365-day configuration. Expect greater runtime and storage use. |
+| `--forecast-epochs N` | Set LSTM forecasting training epochs (default 5). |
+| `--skip-training` | Generate data but skip model training and downstream prediction/report workflow. |
+| `--skip-report` | Skip PDF report generation. |
+| `--skip-sample-export` | Skip sample API payload export. |
+| `--optimize-models` | Run optional Optuna tuning before model training. |
+| `--optimization-trials N` | Set tuning trial count (default 8). |
+| `--start-api` | Start FastAPI after running the bootstrap with this command's settings (port 8000). |
+
+The API startup checks for expected artifacts and can regenerate missing or mismatched defaults. A small custom generation run may therefore be replaced by default-sized artifacts when the API starts.
+
+### 4. Start the API
+
+Start it directly after generating artifacts:
 
 ```powershell
-$env:SMARTGRID_DEMO_MODE = "1"
-& $PYTHON -m uvicorn api.main:app --host 127.0.0.1 --port 8000
+python -m uvicorn api.main:app --host 127.0.0.1 --port 8000
 ```
 
-### 12.7 Start the Frontend
+Or bootstrap and start together with `python run_project.py --start-api`. Keep the terminal open while using the application; stop with `Ctrl+C`.
+
+Open `http://127.0.0.1:8000/login` to sign in. The API serves the dashboard and portal assets on the same origin. Common local URLs:
+
+- Login: `http://127.0.0.1:8000/login`
+- Operator dashboard: `http://127.0.0.1:8000/dashboard/`
+- Admin client management: `http://127.0.0.1:8000/dashboard/admin/clients.html`
+- Inspector portal: `http://127.0.0.1:8000/inspector`
+- Client portal: `http://127.0.0.1:8000/client`
+- Health: `http://127.0.0.1:8000/health`
+- Interactive OpenAPI docs: `http://127.0.0.1:8000/docs`
+
+Check health from another PowerShell window:
 
 ```powershell
-Set-Location dashboard
-& $PYTHON -m http.server 8080
+Invoke-RestMethod http://127.0.0.1:8000/health | ConvertTo-Json -Depth 6
 ```
 
-### 12.8 Run Everything with a Single Bootstrap Command
+A degraded response indicates missing or unavailable runtime artifacts; inspect the payload and regenerate with `python run_project.py` when appropriate.
+
+## Configuration
+
+The main settings read by the application include:
+
+| Variable | Default / behavior |
+|---|---|
+| `SMARTGRID_ADMIN_EMAIL` | Admin identity; configure for local use. |
+| `SMARTGRID_ADMIN_PASSWORD` | Admin password; replace the example value. |
+| `SMARTGRID_SESSION_SECRET` | Session-signing secret; at least 32 characters. |
+| `SMARTGRID_COOKIE_SECURE` | Secure cookie flag; keep enabled behind HTTPS, set `0` only for local HTTP. |
+| `SMARTGRID_CORS_ORIGINS` | Comma-separated exact allowed browser origins; configure to match the app origin(s). |
+| `SMARTGRID_UPDATE_INTERVAL` | Live simulation tick interval in seconds; default 4. |
+| `SMARTGRID_FULL_SCALE` | `1` selects larger API bootstrap generation defaults; default `0`. |
+| `SMARTGRID_DEMO_MODE` | Enables demo-only behavior when set to `1`; default `0`. |
+| `SMARTGRID_ENABLE_ALERTS` | Enables configured alert delivery when set to `1`; default `0`. Configure provider credentials before enabling. |
+| `OPENWEATHER_API_KEY` | Optional weather integration key; simulated weather is used when unavailable. |
+| `TRUSTFED_DB_PATH` | Federated client/coordinator SQLite database path (see `.env.example`). |
+| `TRUSTFED_CASE_DB_PATH` | Optional investigation case database path. |
+
+Email and Telegram settings are also listed in `.env.example`. Keep integrations disabled until their credentials and destinations are deliberately configured. Runtime SQLite tables, generated data and models are local files and need suitable persistence/backup arrangements if retained.
+
+## Dashboard and user workflows
+
+The main dashboard under `dashboard/` contains views for overview, live monitoring, theft detection, anomaly detection, demand forecasts, energy efficiency, pole monitoring, heatmaps, weather impact, alerts and reports. It reads API endpoints and the `/ws/live` stream. The live replay interval defaults to four seconds.
+
+Other workflows:
+
+- **Admin:** manage federated client organizations, start and aggregate rounds, inspect trust/audit information, review investigation records, and manage inspector accounts.
+- **Inspector:** view area-filtered cases, inspect meter details, and record assigned inspection task completion.
+- **Federated client:** review its organization profile, register dataset metadata, see rounds/update/trust history, and submit local model updates through the client agent.
+
+The static dashboard can be previewed separately with `python -m http.server 8080 --directory dashboard`, but authentication and same-origin routes are intended to be used through the FastAPI-served application. For a separate origin, configure `SMARTGRID_CORS_ORIGINS` and the frontend API base deliberately.
+
+## HTTP API
+
+The interactive API schema at `/docs` is the authoritative request/response reference. The main route groups are:
+
+| Routes | Purpose |
+|---|---|
+| `GET /health` | Runtime and artifact health. |
+| `POST /auth/login`, `POST /auth/logout`, `GET /auth/session` | Admin/inspector session workflow. |
+| `GET /overview`, `/meters`, `/anomalies`, `/theft`, `/weather-impact`, `/forecast`, `/risk-scores`, `/efficiency`, `/drift-report` | Operational analytics. |
+| `GET /api/pole-status`, `/api/pole-tamper-alerts`, `/api/pole-energy-balance` | Pole monitoring results. |
+| `POST /predict` | Score one meter reading or a list of readings using the centralized inference pipeline. |
+| `GET /artifacts/daily-report`, `/artifacts/drift-report`, `/artifacts/sample-overview`, `/artifacts/heatmap` | Download generated outputs. |
+| `GET /ws/live` | Authenticated live snapshot WebSocket. |
+| `/api/inspectors`, `/api/inspector/*` | Inspector management and task workflow; authorization is role-scoped. |
+| `/api/clients`, `/api/client/*`, `/api/federated/*`, `/api/admin/trust`, `/api/admin/audit` | Federated client portal/coordinator workflow; authorization is role-scoped. |
+| `/api/admin/investigations/*`, `/api/admin/analytics/summary` | Admin investigation and summary operations. |
+| `/api/research/experiments` | Bounded admin research experiment submission and result retrieval. |
+
+Operational data and artifact routes require an authenticated session. Use `/docs` for schemas, limits and exact response fields. Prediction inputs are validated and reject unexpected fields; the numeric constraints are defined by the `MeterReading` model in `api/main.py`.
+
+## Data and generated artifacts
+
+### Default synthetic data
+
+`src/data_generator.py` creates a synthetic history and live replay using Bengaluru area locations and meter profiles. Generation defaults are in `utils/helpers.py`:
+
+| Mode | Meters | History | Sample rows | Live replay |
+|---|---:|---:|---:|---:|
+| Default | 500 | 60 days | 45,000 | 10 days, up to 425 meters |
+| Full scale | 1,000 | 365 days | 120,000 | 14 days, up to 80 meters |
+
+Expected outputs include:
+
+- `dataset/smart_meter_data.csv`: full generated synthetic readings.
+- `data/processed/smart_meter_sample.csv`: model training sample.
+- `data/processed/live_simulation.csv`: API replay data.
+- `data/processed/meter_catalog.csv`, `pole_catalog.csv`: generated entity catalogs.
+- `data/processed/generation_summary.json`: generation settings and summary.
+- `models/`: trained anomaly/classification/forecast artifacts and metadata.
+- `database/meter_data.db`: operational simulation snapshots.
+- `database/trustfed_phase2.sqlite3`: federated client, round and audit state (path configurable).
+- `reports/`: PDF reports, drift reports and research result files.
+- `maps/theft_heatmap.html`: generated spatial heatmap.
+
+Generated artifacts may be regenerated by bootstrap/startup commands. Keep source datasets and important experiment outputs separately backed up when needed.
+
+### Feature and prediction overview
+
+Raw meter fields include voltage, current, power, consumption, power factor, weather, location, timestamp and usage profile. Preprocessing and feature engineering derive temporal consumption summaries, peak/night ratios, weather relationships, voltage/current irregularities and power gaps. Runtime enrichment adds anomaly and theft model outputs, risk and efficiency measures, estimated losses, and pole-level signals. The synthetic generator's seeded theft metadata is not used as a direct inference feature for the theft probability.
+
+The model families and fallbacks are described in [method](docs/METHOD.md). Forecasts and classification should be interpreted within the limits of their training data and evaluation split; synthetic labels can make demo metrics look much stronger than transfer to real meters would be.
+
+## Federated learning workflows
+
+### In-process research simulation
+
+`src/federated/experiment.py` supports generated classification fixtures, client partitioning, local training, FedAvg and robust/trust-oriented aggregation comparisons, and controlled simulated attacks. For example:
 
 ```powershell
-& $PYTHON run_project.py --start-api
+python -c "from src.federated.experiment import run_experiment; result = run_experiment({'samples': 400, 'features': 10, 'clients': 4, 'rounds': 3, 'local_epochs': 2, 'partition': 'severe', 'attack': 'sign', 'seed': 42}, output_dir='reports/research_runs/smoke'); print(result['metrics'])"
+python scripts/run_trust_validation.py
 ```
 
-This generates artifacts first and then launches the backend.
+The generated fixture is not electricity data. Trust scores and HATTA are experimental heuristics; their behavior varies by attack and data distribution. The trust study report documents false accusation and missed attack cases. Do not use the score as sole evidence for punitive actions.
 
-## 13. Configuration
+### Multi-client coordinator prototype
 
-### 13.1 Main Environment Variables
+The Phase-II workflow is described in [the multi-client architecture note](docs/PHASE_II_MULTI_CLIENT_ARCHITECTURE.md). An administrator creates client organizations and a round. Each organization runs `client_agent/client_agent.py` against its local CSV and submits a signed parameter update; the coordinator then validates and aggregates accepted updates. The client agent supports a binary logistic regression baseline with shared, ordered numeric features. The coordinator stores and can inspect submitted parameter vectors; no raw CSV rows are sent by the agent.
 
-The `.env.example` file currently includes:
+Follow [the client agent guide](client_agent/README.md) for the exact command and feature requirements. Use HTTPS outside localhost, agree on feature names/order/units and label semantics across clients, and treat secrets as credentials. Dataset registration records metadata; it does not independently verify the dataset's contents.
 
-- `OPENWEATHER_API_KEY`
-- `SMARTGRID_UPDATE_INTERVAL`
-- `SMARTGRID_FULL_SCALE`
-- `SMARTGRID_ENABLE_ALERTS`
-- `SMARTGRID_SLACK_WEBHOOK`
-- `SMARTGRID_TELEGRAM_BOT_TOKEN`
-- `SMARTGRID_TELEGRAM_CHAT_ID`
-- `SMARTGRID_SMTP_HOST`
-- `SMARTGRID_SMTP_PORT`
-- `SMARTGRID_SMTP_USER`
-- `SMARTGRID_SMTP_PASSWORD`
-- `SMARTGRID_ALERT_EMAIL_FROM`
-- `SMARTGRID_ALERT_EMAIL_TO`
+This prototype is not network-isolated federation, cryptographic secure aggregation, or complete end-to-end differential privacy. The application-level federated agent path does not enforce a formal privacy budget. See the limitations documents before handling real utility data.
 
-Additional runtime variables used in code:
+### Research components
 
-- `SMARTGRID_DEMO_MODE`
-  Disables periodic reporting by default for presentation-friendly runtime behavior.
+Additional modules include FedProx and Multi-Krum experiment primitives, SCAFFOLD control-variate helpers, Gaussian privacy accounting utilities, pairwise-mask secure-sum reference code, checkpoint helpers and a local hash-linked ledger. Integration and guarantees vary by component. In particular, the reference secure-sum helper is not production cryptography, the local ledger is not a distributed blockchain, and the accountant does not establish application-wide DP. See [implementation updates](docs/IMPLEMENTATION_UPDATES_2026-10-30.md) and [extended validation](docs/EXTENDED_IMPLEMENTATION_AND_VALIDATION_2026-10-30.md).
 
-- `SMARTGRID_ENABLE_PERIODIC_REPORTS`
-  Explicitly controls periodic report generation in the runtime loop.
+## Optional CEEW and SGCC research
 
-### 13.2 Common Configuration Notes
+### CEEW consumption data
 
-- Set `SMARTGRID_FULL_SCALE=1` to make the API bootstrap using the full generation profile.
-- Set `SMARTGRID_ENABLE_ALERTS=1` only when email, Slack, or Telegram configuration is ready.
-- Leave `OPENWEATHER_API_KEY` empty if synthetic weather is acceptable.
-- Adjust `SMARTGRID_UPDATE_INTERVAL` if you want a faster or slower live replay loop.
-
-## 14. Docker Support
-
-The project includes both a `Dockerfile` and `docker-compose.yml`.
-
-### 14.1 Dockerfile
-
-The API image:
-
-- uses Python 3.11
-- installs `requirements.txt`
-- exposes port `8000`
-- starts `uvicorn api.main:app --host 0.0.0.0 --port 8000`
-
-### 14.2 Docker Compose Services
-
-The compose setup defines two services:
-
-- `api`
-  FastAPI backend with mounted volumes for data, models, reports, maps, database, and sample outputs.
-
-- `dashboard`
-  Nginx-based static dashboard server.
-
-Exposed ports:
-
-- API: `8000`
-- Dashboard: `8080`
-
-### 14.3 Run with Docker Compose
+The supplied CEEW Mathura/Bareilly files support consumption profiling, forecasting and unlabeled analysis. They do not contain verified theft labels. To profile source CSVs without normalizing them:
 
 ```powershell
+python scripts/prepare_ceew_dataset.py --profile-only --chunksize 200000 --output reports/research_runs/ceew_profile --input "C:\path\to\source.csv" "C:\path\to\another.csv"
+```
+
+To normalize the daily aggregates and run the documented forecast experiment, use the commands and file names in [dataset sources](docs/DATASETS.md) and [dataset card](docs/DATASET_CARD.md). High-frequency sources may be too large for the current in-memory forecast runner. The recorded CEEW results are consumption forecasting results, not theft detection; the trained approaches did not outperform the persistence baseline in the documented evaluation.
+
+### SGCC theft dataset
+
+No SGCC files are bundled and no SGCC benchmark was run. The loader and experiment require a separately acquired, licensed/authorized dataset. See [labeled data instructions](data/labels/README.md) and [dataset sources](docs/DATASETS.md), including provenance, licensing and validation requirements. Do not infer an Indian utility result from a Chinese dataset.
+
+## Docker
+
+The default Compose services run the API on port 8000 and a separate Nginx static dashboard on port 8080. The API also serves its own dashboard and authentication routes. Persistent local directories are mounted for data, database, dataset, maps, models, reports and sample outputs.
+
+```powershell
+$env:POSTGRES_PASSWORD = "use-a-long-local-secret"
 docker compose up --build
 ```
 
-Then open:
+The default Compose invocation starts the `api` and `dashboard` services. PostgreSQL, Redis and the PostgreSQL worker are under the `production` profile (`docker compose --profile production up --build`). Their presence is infrastructure scaffolding; the main application persistence and workflows are not fully migrated to PostgreSQL/Redis or a distributed worker architecture. Configure and review secrets before using any deployment profile. The container exposes the API on all interfaces; restrict network access appropriately.
 
-- API: `http://127.0.0.1:8000`
-- Dashboard: `http://127.0.0.1:8080`
+## Tests and evaluation
 
-## 15. API Reference
-
-### 15.1 Main Endpoints
-
-- `GET /`
-- `GET /health`
-- `GET /overview`
-- `GET /meters`
-- `GET /anomalies`
-- `GET /theft`
-- `GET /weather-impact`
-- `GET /forecast`
-- `GET /risk-scores`
-- `GET /efficiency`
-- `GET /api/pole-status`
-- `GET /api/pole-tamper-alerts`
-- `GET /api/pole-energy-balance`
-- `GET /drift-report`
-- `POST /predict`
-
-### 15.2 Artifact Endpoints
-
-- `GET /artifacts/daily-report`
-- `GET /artifacts/drift-report`
-- `GET /artifacts/sample-overview`
-- `GET /artifacts/heatmap`
-
-### 15.3 WebSocket Endpoint
-
-- `WS /ws/live`
-
-### 15.4 `POST /predict` Input
-
-The prediction endpoint accepts one meter reading or a list of readings. Important fields include:
-
-- `meter_id`
-- `timestamp` optional
-- `region`
-- `area`
-- `latitude`
-- `longitude`
-- `voltage`
-- `current`
-- `power`
-- `consumption_kwh`
-- `power_factor`
-- `temperature`
-- `humidity`
-- `rainfall`
-- `wind_speed`
-- `weather_condition`
-- `expected_consumption_kwh` optional
-- `wastage_score` optional
-- `usage_profile`
-- `theft_type`
-- `seeded_theft_probability`
-
-### 15.5 `POST /predict` Output
-
-Each prediction response returns fields such as:
-
-- `meter_id`
-- `region`
-- `area`
-- `latitude`
-- `longitude`
-- `status`
-- `theft_probability`
-- `anomaly_score`
-- `risk_score`
-- `risk_level`
-- `efficiency_score`
-- `reason`
-
-## 16. Testing
-
-Pytest coverage exists for major system layers.
-
-Current test modules:
-
-- `tests/test_api.py`
-- `tests/test_data_pipeline.py`
-- `tests/test_forecasting_and_exports.py`
-- `tests/test_advanced_analytics.py`
-- `tests/test_theft_detector.py`
-
-Covered areas include:
-
-- API health and payload structure
-- live theft candidate injection behavior
-- sticky theft runtime behavior
-- theft and anomaly payload counts
-- pole endpoint responses and pole payload helpers
-- meter catalog geographic bounds
-- stable live theft generation rules
-- preprocessing and feature engineering outputs
-- pole hierarchy generation and energy-gap detection
-- risk scoring and efficiency metrics
-- forecasting fallback behavior
-- export generation
-- theft probability calibration
-- WebSocket registration failure handling
-
-Run tests with:
+Install test dependencies if needed, then run from the repository root:
 
 ```powershell
-& $PYTHON -m pytest
-```
-
-## 17. Project Workflow Summary
-
-A typical workflow for this repository is:
-
-1. Install dependencies.
-2. Generate synthetic data and train models with `run_project.py`.
-3. Start the FastAPI backend.
-4. Start the static dashboard server.
-5. Use `/health` to confirm the backend is ready.
-6. Open the dashboard and point it to `http://127.0.0.1:8000`.
-7. Monitor theft, anomalies, forecasts, pole alerts, and report artifacts.
-
-## 18. Troubleshooting
-
-### 18.1 Deep Learning Library Warnings
-
-Warnings from TensorFlow or PyTorch about CPU optimizations, missing GPU support, or oneDNN are usually informational.
-
-### 18.2 Optional Dependency Fallbacks
-
-The codebase includes several fallbacks:
-
-- boosted theft model fallback when XGBoost is unavailable
-- forecast fallback when TensorFlow or PyTorch artifacts are unavailable
-- drift fallback when Evidently is unavailable
-- explainability fallback when SHAP is unavailable
-- synthetic weather fallback when OpenWeather is not configured
-
-### 18.3 Dashboard Shows No Data
-
-Check that:
-
-- the API is running on `127.0.0.1:8000`
-- the frontend static server is running on `8080`
-- the dashboard API base URL is correct
-- `run_project.py` or API bootstrap has generated required artifacts
-
-### 18.4 Missing Reports or Heatmaps
-
-Regenerate artifacts with:
-
-```powershell
-& $PYTHON run_project.py
-```
-
-### 18.5 Alert Delivery Not Working
-
-Check that:
-
-- `SMARTGRID_ENABLE_ALERTS=1`
-- SMTP, Slack, or Telegram variables are correctly configured
-- the machine has outbound network access
-
-### 18.6 Runtime Regenerates Data Unexpectedly
-
-The API bootstrap intentionally regenerates artifacts when required files are missing or when the live dataset and metadata do not match the expected configuration.
-
-## 19. Presentation Summary
-
-This project simulates a Bengaluru smart-grid intelligence platform. It generates synthetic smart-meter data with weather, theft, anomaly, wastage, and pole-level tamper behavior; trains multiple ML models; replays the data as a live FastAPI stream; stores runtime snapshots in SQLite; and visualizes the full monitoring workflow in a multi-section dashboard. The result is a complete demonstration of electricity theft detection, anomaly monitoring, energy efficiency analysis, demand forecasting, weather impact analysis, drift detection, and pole tamper surveillance.
-
-## 20. Detailed Model Selection Rationale
-
-This project does not use only one model because the problem is not only one machine learning task. Electricity theft detection involves abnormal-pattern discovery, supervised theft classification, demand forecasting, risk ranking, pole-level energy-balance analysis, explainability, and drift monitoring. Each part has a different data shape and operational goal.
-
-### 20.1 Models Actually Used
-
-| Project Need | Model or Method Used | Main File | Why It Is Used |
-| --- | --- | --- | --- |
-| Meter anomaly detection | Isolation Forest | `src/train_models.py`, `src/detect_anomaly.py` | Detects rare or unusual meter behavior without needing every possible theft pattern to be labelled. |
-| Theft classification | Random Forest Classifier | `src/train_models.py`, `src/theft_detector.py` | Strong, stable model for structured tabular data; handles nonlinear rules and mixed feature interactions well. |
-| Theft classification | XGBoost Classifier | `src/train_models.py`, `src/theft_detector.py` | Boosted trees usually perform well on fraud-like structured data and can capture sharp decision boundaries. |
-| Theft classification fallback | HistGradientBoostingClassifier | `src/train_models.py` | Keeps the pipeline working even if the `xgboost` package is unavailable. |
-| Demand forecasting | LSTM | `src/demand_forecasting.py` | Learns sequential consumption behavior such as hourly and daily demand cycles. |
-| Demand forecasting | Transformer Regressor | `src/transformer_forecasting.py` | Provides an advanced time-series model that can learn longer-range temporal relationships. |
-| Forecast fallback | Seasonal baseline forecaster | `src/demand_forecasting.py`, `src/transformer_forecasting.py` | Keeps forecast APIs and dashboards functional even when deep learning libraries or trained artifacts are missing. |
-| Pole tamper detection | Isolation Forest plus energy-balance heuristics | `src/pole_tamper_detector.py` | Detects abnormal pole-level energy mismatch, hidden load, and possible illegal connections. |
-| Risk ranking | Weighted risk scoring | `src/risk_scoring.py` | Converts model outputs and electrical signals into an operational priority score. |
-| Explainability | SHAP or fallback feature importance | `src/explainable_ai.py` | Explains why a meter is suspicious, which is important for inspector decisions. |
-| Drift monitoring | Evidently or fallback statistical drift checks | `src/data_drift_monitor.py` | Checks whether live data has shifted away from historical training data. |
-| Hyperparameter tuning | Optuna | `src/model_optimizer.py` | Optionally searches better parameters for Isolation Forest, Random Forest, and XGBoost. |
-
-### 20.2 Why Isolation Forest Was Chosen
-
-Isolation Forest is used for anomaly detection because theft and electrical faults are rare compared with normal readings. The model works by isolating unusual points faster than common points. In this project, it is trained mainly on normal records and produces an `anomaly_score`. A high score means the reading behaves differently from the learned normal pattern.
-
-It is useful here because not every real theft case will look exactly like the synthetic labels. For example, a meter bypass, voltage drop, power-factor issue, and unusual night usage may appear in different combinations. Isolation Forest gives the system a way to flag suspicious readings even before the supervised classifier is fully confident.
-
-Why not only Isolation Forest:
-
-- It is unsupervised, so it does not directly learn the difference between theft, wastage, and harmless unusual demand.
-- It can flag genuine high consumption as anomalous.
-- It gives anomaly evidence, but it is not enough for final theft classification.
-
-### 20.3 Why Random Forest Was Chosen
-
-Random Forest is used as a supervised theft classifier because the dataset contains labelled `is_theft` examples generated from known theft scenarios. It works well with tabular features such as voltage, current, consumption, power factor, weather, usage profile, area, rolling averages, night usage ratio, and wastage score.
-
-It was chosen because:
-
-- it is robust on tabular data
-- it handles nonlinear relationships
-- it is less sensitive to feature scaling
-- it gives reliable baseline performance
-- it can handle noisy synthetic data better than a single decision tree
-- it supports class balancing with `class_weight="balanced_subsample"`
-
-Why not only Random Forest:
-
-- Boosted models often provide better probability separation on fraud-style tabular data.
-- Random Forest may average many trees and become less sharp near difficult boundaries.
-- It may be less efficient than boosting when the goal is high recall on rare suspicious events.
-
-### 20.4 Why XGBoost Was Chosen
-
-XGBoost is used as the stronger boosted theft classifier. It trains trees sequentially, where each new tree focuses on errors from previous trees. This is useful in theft detection because the suspicious class may be rare, and important patterns may depend on feature interactions.
-
-It was chosen because:
-
-- it performs very well on structured/tabular ML problems
-- it can capture complex theft signatures
-- it usually gives strong ranking probabilities
-- it handles mixed signal strength better than simple linear models
-- it is common in fraud detection, credit risk, and anomaly-heavy classification
-
-Why a fallback model is included:
-
-The project should still run on machines where XGBoost is not installed. In that case, `HistGradientBoostingClassifier` is used as a scikit-learn fallback. The saved artifact path remains `models/xgboost_model.pkl`, but the metadata records whether the actual model is `xgboost` or `hist_gradient_boosting_fallback`.
-
-### 20.5 Why Random Forest and XGBoost Are Combined
-
-The final theft probability is not taken from only one classifier. In `src/theft_detector.py`, the project blends the probabilities:
-
-```text
-blended_probability = 0.45 * random_forest_probability + 0.55 * xgboost_probability
-```
-
-Then the project calibrates the final score using:
-
-- blended supervised model probability
-- seeded theft probability from the generator
-- anomaly score
-- wastage score
-
-The theft probability is now a blend of the supervised classifier outputs only. Anomaly and wastage remain separate signals, and the current fallback decision threshold is 0.5 unless the saved model metadata specifies another threshold. This threshold still requires selection on a validation set for research evaluation.
-
-This design was chosen because a practical theft system should not depend on one signal. A meter may be suspicious because of model confidence, abnormal usage, wastage, voltage irregularity, or seeded theft behavior in the live demo.
-
-### 20.6 Why LSTM Was Chosen for Forecasting
-
-Electricity demand is time-series data. Hourly consumption depends on previous hours, time of day, day of week, weather, and usage profile. LSTM is designed to learn sequential patterns and can remember context over a lookback window.
-
-In this project:
-
-- readings are grouped by timestamp
-- total consumption is converted into a demand series
-- the model uses a 24-hour lookback window
-- it predicts future values recursively
-- outputs are summarized as next hour, next day, and next week
-
-Why not only a statistical model:
-
-Simple methods like moving average or ARIMA are easier to explain, but they may struggle when demand behavior is nonlinear and influenced by weather, area mix, and usage profile changes.
-
-### 20.7 Why Transformer Forecasting Was Added
-
-The Transformer forecaster gives a second advanced forecasting approach. Unlike LSTM, a Transformer encoder can learn relationships across positions in the input sequence using attention. In this project it is intentionally compact, CPU-friendly, and used for comparison rather than as a huge deep learning model.
-
-It was chosen because:
-
-- it represents a modern time-series modeling approach
-- it can learn longer temporal relationships
-- it gives a useful comparison against LSTM
-- it makes the forecasting module more complete for academic explanation
-
-Why not only Transformer:
-
-- it may need more data to outperform simpler methods
-- it depends on PyTorch availability
-- it is less straightforward to explain than LSTM or tree models
-- for a small demo dataset, a baseline may sometimes be more stable
-
-### 20.8 Why Baseline Fallbacks Are Important
-
-The project includes fallback behavior intentionally. If TensorFlow, PyTorch, XGBoost, SHAP, Evidently, or Optuna is unavailable, the system should still run.
-
-Fallbacks are important because:
-
-- project demos should not fail due to optional library installation issues
-- API endpoints should keep returning valid payloads
-- dashboards should remain usable
-- tests can validate behavior without requiring every heavy dependency
-- users can run the core project on normal laptops
-
-### 20.9 Other Models That Could Be Used
-
-The following models are possible alternatives or future improvements.
-
-| Model | Where It Could Be Used | Why It Could Help | Why It Was Not the Main Choice |
-| --- | --- | --- | --- |
-| Logistic Regression | Theft classification | Simple, interpretable baseline | Too linear for complex theft patterns. |
-| Decision Tree | Theft classification | Easy to visualize and explain | Overfits easily and is weaker than Random Forest. |
-| Support Vector Machine | Theft classification/anomaly | Can work well on smaller datasets | Scaling and probability calibration are harder for large tabular streams. |
-| KNN | Anomaly or theft classification | Simple distance-based reasoning | Slow at prediction time and sensitive to scaling. |
-| Naive Bayes | Baseline classification | Fast and simple | Feature independence assumption is unrealistic for electrical data. |
-| CatBoost | Theft classification | Excellent for categorical tabular features | Adds another external dependency; XGBoost is already common and available. |
-| LightGBM | Theft classification | Very fast gradient boosting | Another dependency; XGBoost/scikit fallback is enough for this project. |
-| Autoencoder | Anomaly detection | Learns compressed normal behavior | Needs neural-network training and tuning; less interpretable than Isolation Forest. |
-| One-Class SVM | Anomaly detection | Classic one-class anomaly method | Can be slow and sensitive to kernel/scaling choices. |
-| Local Outlier Factor | Anomaly detection | Good for local density anomalies | Less convenient for stable deployed prediction on new streaming points. |
-| ARIMA/SARIMA | Demand forecasting | Strong classical time-series baseline | Less flexible for nonlinear effects and multiple external signals. |
-| Prophet | Demand forecasting | Good trend/seasonality decomposition | Extra dependency and less aligned with custom deep learning comparison. |
-| GRU | Demand forecasting | Lighter alternative to LSTM | Similar purpose; LSTM is more commonly explained in coursework. |
-| Temporal CNN | Demand forecasting | Fast sequence modeling | Less familiar for many interview explanations. |
-| Graph Neural Network | Grid/pole topology modeling | Could model transformer-pole-meter relationships directly | More complex and not necessary for this demo scale. |
-
-### 20.10 Did This Project Choose Only One Model?
-
-No. The project uses a multi-model approach:
-
-- Isolation Forest finds unusual meter behavior.
-- Random Forest learns labelled theft patterns.
-- XGBoost or HistGradientBoosting improves supervised theft scoring.
-- LSTM forecasts future demand.
-- Transformer forecasting provides an advanced comparison model.
-- Pole tamper detection combines energy-balance rules with Isolation Forest.
-- Risk scoring blends model outputs into operational severity.
-
-The operational status combines supervised classification with separate anomaly and wastage statuses. Synthetic labels and seeded generation context must not be treated as prediction evidence.
-
-### 20.11 Final Model Decision Summary
-
-The selected models are appropriate because the project uses structured smart-meter data, rare-event theft labels, time-series demand behavior, and operational dashboard requirements.
-
-- For anomaly detection, Isolation Forest is simple, fast, and suitable for rare abnormal readings.
-- For theft classification, Random Forest gives robustness and XGBoost gives stronger boosted performance.
-- For forecasting, LSTM and Transformer models match the sequential nature of electricity demand.
-- For deployment reliability, fallback models keep the system usable even when optional ML libraries are missing.
-- For real-world usefulness, explainability, drift monitoring, and risk scoring turn raw predictions into inspection-ready information.
-
-## 21. In-Depth Interview Questions
-
-## 22. Federated Research Prototype
-
-The research experiment code is in `src/federated/`. It provides deterministic client partitions, local logistic training, FedAvg, coordinate trimmed mean, a provisional temporal trust candidate, poisoning hooks, metrics, and JSON/checkpoint artifacts. See [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md) for scope and limitations.
-
-Run automated tests with `python -m pytest -q`. Run a measured CPU smoke experiment and save results with:
-
-```powershell
-python -c "from src.federated.experiment import run_experiment; print(run_experiment({'samples': 400, 'features': 10, 'clients': 4, 'rounds': 3, 'local_epochs': 2, 'partition': 'severe', 'attack': 'sign', 'seed': 42}, output_dir='reports/research_runs/smoke'))"
-```
-
-The dashboard's **Federated Research** view uses admin-only API endpoints. Configure `SMARTGRID_ADMIN_PASSWORD`, a random `SMARTGRID_SESSION_SECRET` of at least 32 characters, and `SMARTGRID_COOKIE_SECURE` in `.env` before login. For local HTTP development only, set `SMARTGRID_COOKIE_SECURE=0`. Do not commit `.env`.
-
-The experiment's validation set is visible to the coordinator. Client simulation runs in one process and is not a deployment privacy boundary. Differential privacy and secure aggregation are disabled. The attack simulations do not yet include targeted backdoor success measurement. Do not describe the provisional method as novel or superior without further experiments and literature review.
-
-### CEEW real smart-meter dataset
-
-The supplied CEEW Mathura/Bareilly measurements are integrated as unlabeled real consumption data. The source files contain three-minute meter readings and separate daily aggregate series; none contains verified theft labels. Use them for consumption forecasting, supply-quality/heterogeneity analysis, and unlabeled anomaly triage only. Do not report theft-detection classification metrics from these observations. See [`docs/DATASET_CARD.md`](docs/DATASET_CARD.md) for the inspected schema, quality report, license citation, exact results, and limitations.
-
-Use the chunked ingestion command with paths to files you have acquired; raw readings stay outside version control and normalized outputs are written under ignored `data/processed/ceew/`:
-
-```powershell
-python scripts/prepare_ceew_dataset.py --profile-only --output reports/research_runs/ceew_profile --input "C:\path\to\source.csv"
-python scripts/prepare_ceew_dataset.py --output data/processed/ceew --input "C:\path\to\SM Cleaned Data BR Aggregated.csv" "C:\path\to\SM Cleaned Data MH Aggregated.csv"
-```
-
-The daily aggregate data supports a meter-partitioned, chronological consumption forecast comparison. See [`docs/DATASETS.md`](docs/DATASETS.md) for the full command and validation protocol. The federated electricity-theft classifier and trust-detection results remain on their separate synthetic labeled fixture.
-
-The forecast runner supports deterministic complete-meter client groups and a two-client city split via `--client-partition location --clients 2`; both modes avoid splitting a meter across clients. The city split is an exploratory non-IID pilot only.
-
-These questions are based directly on this project. They cover data generation, preprocessing, model selection, training, backend runtime behavior, API design, dashboard design, testing, and deployment.
-
-### 21.1 Project Overview Questions
-
-1. What real-world problem does this project solve, and why is electricity theft detection important for smart grids?
-2. Why did you build this system as an end-to-end project instead of only a machine learning notebook?
-3. What are the main modules of the project, and how does data flow from generation to dashboard?
-4. What is the difference between electricity theft, anomaly, and power wastage in this project?
-5. How does the project simulate real smart-meter behavior for Bengaluru?
-6. Why did you include both meter-level and pole-level monitoring?
-7. What are the main outputs of the system for an electricity board or field inspector?
-8. How would you explain this project to a non-technical electricity department officer?
-9. What makes this project different from a basic binary classification project?
-10. What are the limitations of using synthetic data for electricity theft detection?
-
-### 21.2 Dataset and Data Generation Questions
-
-1. Why did you generate synthetic data instead of using a public real-world dataset?
-2. What assumptions did you make while generating meter consumption data?
-3. Which Bengaluru areas are included, and why is location useful in theft detection?
-4. How are usage profiles such as residential, commercial, industrial, night usage, and AC-heavy simulated?
-5. How does temperature affect expected electricity consumption in the generated data?
-6. How are rainfall, humidity, and wind speed used in the data?
-7. What is the difference between `expected_consumption_kwh`, `consumption_kwh`, and `power`?
-8. How are theft scenarios injected into the dataset?
-9. Explain the five theft types used in this project.
-10. What is `seeded_theft_probability`, and why is it useful in live simulation?
-11. How does the project keep live theft meters stable for dashboard demonstrations?
-12. What is the purpose of `meter_catalog.csv`?
-13. What is the purpose of `pole_catalog.csv`?
-14. How does the transformer-pole-meter hierarchy help identify illegal connections?
-15. How would the system change if real smart-meter data were available?
-
-### 21.3 Preprocessing and Feature Engineering Questions
-
-1. Why is feature engineering important for smart-meter theft detection?
-2. What are the base numerical features used for model training?
-3. Which categorical features are one-hot encoded?
-4. Why is `hour_of_day` important?
-5. Why is `day_of_week` important?
-6. How is `rolling_average_consumption` calculated, and why does it help?
-7. What does `consumption_variance` indicate?
-8. What is `peak_usage_ratio`, and how can it reveal abnormal usage?
-9. What is `night_usage_ratio`, and why is night usage important in theft cases?
-10. Why is `weather_consumption_ratio` useful?
-11. How can `power_factor_loss` indicate inefficient or suspicious behavior?
-12. How does `voltage_irregularity` help detect tampering?
-13. What is `current_power_gap`, and what electrical inconsistency can it capture?
-14. How does the code handle missing columns in incoming prediction requests?
-15. Why must prediction-time feature columns match training-time feature columns?
-
-### 21.4 Anomaly Detection Questions
-
-1. Why did you choose Isolation Forest for anomaly detection?
-2. How does Isolation Forest detect abnormal data points?
-3. Why is anomaly detection useful even when labelled theft data exists?
-4. What is the meaning of `anomaly_score` in this project?
-5. How is `is_anomaly` decided?
-6. Why is the anomaly threshold stored in model metadata?
-7. Why is the Isolation Forest trained mainly using normal records?
-8. What can cause a false positive anomaly in electricity data?
-9. What can cause a false negative anomaly in electricity data?
-10. How would you tune the contamination parameter?
-11. Why might Isolation Forest be better than KNN for this project?
-12. Why might an autoencoder be a possible future alternative?
-13. How would you evaluate anomaly detection without perfect labels?
-14. How does anomaly detection influence the final theft probability?
-15. How would you explain Isolation Forest to a panel in simple language?
-
-### 21.5 Theft Classification Questions
-
-1. Why is theft detection treated as a supervised classification problem?
-2. Why are Random Forest and XGBoost both used?
-3. How does Random Forest work internally?
-4. How does XGBoost work internally?
-5. Why can boosted trees perform well on fraud-like tabular data?
-6. What is the final theft probability formula in the project?
-7. Why does the project give 55 percent weight to XGBoost and 45 percent to Random Forest in the initial blend?
-8. Why are anomaly score, wastage score, and seeded theft probability added after model prediction?
-9. Why is `Electricity Theft` assigned when theft probability is at least `0.9`?
-10. How does the classifier distinguish between theft and power wastage?
-11. What does `class_weight="balanced_subsample"` do in Random Forest?
-12. How are precision, recall, F1 score, accuracy, and ROC-AUC used?
-13. In this project, which metric matters more: precision or recall? Why?
-14. What is the risk of high false positives in theft detection?
-15. What is the risk of high false negatives in theft detection?
-16. Why is `HistGradientBoostingClassifier` used as a fallback?
-17. How would you improve theft classification with real customer billing data?
-18. How would you handle class imbalance in real theft datasets?
-19. Why should model probability be calibrated before operational use?
-20. How would you explain a theft prediction to an inspector?
-
-### 21.6 Forecasting Questions
-
-1. Why is demand forecasting included in a theft detection project?
-2. What is the difference between theft detection and demand forecasting?
-3. Why is electricity demand a time-series problem?
-4. How does the project build the demand series before training?
-5. Why is a 24-hour lookback window used?
-6. How does an LSTM remember sequence information?
-7. What are the main layers in the LSTM model?
-8. Why is MinMaxScaler used before LSTM training?
-9. How does the project forecast next hour, next day, and next week demand?
-10. What is recursive forecasting?
-11. What problems can happen in recursive forecasting?
-12. Why was a Transformer model added?
-13. What is attention in a Transformer?
-14. How is the project Transformer different from a large language model?
-15. Why does the project include a baseline seasonal fallback?
-16. When might a simple baseline outperform LSTM or Transformer?
-17. How would weather forecast data improve demand forecasting?
-18. How would you evaluate forecasting accuracy?
-19. What are MAE, RMSE, and MAPE?
-20. How would poor demand forecasts affect grid operations?
-
-### 21.7 Risk Scoring Questions
-
-1. Why is a risk score needed if the model already predicts theft probability?
-2. Which signals are combined in `score_meter_risk`?
-3. Why are anomaly and theft components heavily weighted?
-4. Why are voltage irregularity and night usage included in risk scoring?
-5. How are risk levels such as Low, Medium, High, and Critical assigned?
-6. How would you decide the best threshold for Critical risk?
-7. What is the difference between model probability and business risk?
-8. How can risk scoring help prioritize field inspections?
-9. What are the dangers of using a fixed risk threshold?
-10. How would you calibrate risk scoring with feedback from inspectors?
-
-### 21.8 Pole Monitoring Questions
-
-1. Why is pole-level monitoring important in electricity theft detection?
-2. What is the formula behind pole energy mismatch?
-3. What is `energy_gap`?
-4. What is `energy_gap_ratio`?
-5. What are technical losses?
-6. How can a pole show theft even when individual meters look normal?
-7. How does the project detect possible illegal connections?
-8. Why does pole tamper detection combine heuristics and Isolation Forest?
-9. What is `tamper_probability`?
-10. What conditions can set `tamper_flag` to 1?
-11. How would real transformer and pole sensor data improve this module?
-12. What are possible false positives in pole tamper detection?
-13. How would you validate pole-level theft detection in the real world?
-14. Why is `connected_meters` stored in the pole catalog?
-15. How can pole alerts support field inspectors?
-
-### 21.9 API and Runtime Questions
-
-1. Why was FastAPI chosen for the backend?
-2. What happens during backend startup?
-3. Why does the API regenerate missing artifacts?
-4. What is the purpose of the live simulation loop?
-5. Why does the runtime advance one tick at startup?
-6. What does `/health` return?
-7. What does `/overview` return?
-8. What does `/predict` do?
-9. Why does `/predict` accept both one reading and a list of readings?
-10. How does the WebSocket endpoint `/ws/live` work?
-11. Why is CORS enabled?
-12. What runtime data is stored in SQLite?
-13. Why use SQLite instead of PostgreSQL for this project?
-14. How would you scale this API for production?
-15. How would you secure the API in a real deployment?
-16. Why are generated artifacts exposed through artifact endpoints?
-17. How does the API support inspector workflows?
-18. What role does authentication play in the dashboard?
-19. How would you handle API failure in the frontend?
-20. How would you monitor this API in production?
-
-### 21.10 Dashboard Questions
-
-1. What is the purpose of the dashboard?
-2. Which dashboard sections are available?
-3. How does the dashboard get data from the backend?
-4. Why does the dashboard show overview, live monitoring, theft, anomaly, forecast, efficiency, heatmap, and pole monitoring separately?
-5. How would an electricity board operator use this dashboard?
-6. How would an inspector use this dashboard?
-7. Why is a heatmap useful for theft detection?
-8. What KPIs should be shown on the overview page?
-9. How would you prevent information overload in the dashboard?
-10. How would you improve the dashboard for mobile inspectors?
-
-### 21.11 Explainability and Drift Questions
-
-1. Why is explainability important in electricity theft detection?
-2. What is SHAP?
-3. How does the fallback explanation method work when SHAP is unavailable?
-4. Why should an inspector not trust only a black-box probability?
-5. What is data drift?
-6. What is concept drift?
-7. Why can smart-meter data drift over time?
-8. How does weather change create drift?
-9. How can consumer behavior changes create drift?
-10. What does Evidently provide?
-11. Why is a fallback statistical drift check included?
-12. How would drift affect model accuracy?
-13. What should happen when drift is detected?
-14. How often should the model be retrained?
-15. How would inspector feedback improve future training?
-
-### 21.12 Testing and Validation Questions
-
-1. What parts of the project are tested with pytest?
-2. Why is testing important in an ML application?
-3. What should be tested in the data generation pipeline?
-4. What should be tested in feature engineering?
-5. What should be tested in theft probability calibration?
-6. What should be tested in API responses?
-7. What should be tested in the inspector workflow?
-8. How do tests help prevent dashboard-breaking API changes?
-9. Why should fallback behavior be tested?
-10. What additional tests would you add before production deployment?
-11. How would you test model performance on real data?
-12. How would you test false positive and false negative behavior?
-13. How would you validate heatmap accuracy?
-14. How would you test WebSocket live updates?
-15. How would you test alert delivery safely?
-
-### 21.13 Deployment and Production Questions
-
-1. How can this project be run locally?
-2. How can it be run using Docker Compose?
-3. What services are defined in `docker-compose.yml`?
-4. What files are generated after running the project?
-5. Which files should not be committed in a real production repository?
-6. How would you deploy this project on a cloud server?
-7. How would you replace synthetic data with real streaming data?
-8. How would you store large smart-meter datasets?
-9. Why might SQLite not be enough for production?
-10. How would you use Kafka or another queue in this system?
-11. How would you schedule periodic model retraining?
-12. How would you handle model versioning?
-13. How would you monitor model performance after deployment?
-14. How would you protect customer privacy?
-15. What security risks exist in a smart-grid theft detection system?
-
-### 21.14 Advanced Machine Learning Questions
-
-1. How would you handle severe class imbalance in real theft data?
-2. How would you choose between Random Forest, XGBoost, LightGBM, and CatBoost?
-3. How would you calibrate predicted probabilities?
-4. What is threshold tuning, and why is it important here?
-5. Why can accuracy be misleading in theft detection?
-6. Why might recall be more important than precision in early theft screening?
-7. Why might precision be more important before sending legal notices?
-8. What is the difference between anomaly detection and fraud classification?
-9. How would you use semi-supervised learning in this project?
-10. How would you use active learning with inspector feedback?
-11. How would you use graph neural networks for transformer-pole-meter topology?
-12. How would you detect coordinated theft in an area?
-13. How would you detect meter tampering from voltage and current waveforms?
-14. How would you use smart-meter event logs in the model?
-15. How would you reduce model bias across different areas or consumer types?
-
-### 21.15 Scenario-Based Interview Questions
-
-1. Suppose the model marks many industrial meters as theft during working hours. What would you check?
-2. Suppose theft probability is low but pole energy gap is high. What does that mean?
-3. Suppose the dashboard shows no live data. How would you debug it?
-4. Suppose XGBoost is not installed on the evaluator's machine. What happens?
-5. Suppose TensorFlow is missing. Will forecasting still work?
-6. Suppose the generated dataset has very low theft rate. How does that affect training?
-7. Suppose the model has high accuracy but low recall. Is it acceptable?
-8. Suppose an inspector says many flagged cases are false positives. What changes would you make?
-9. Suppose a new area is added to Bengaluru. What code or data must change?
-10. Suppose real weather API calls fail. How does the project continue?
-11. Suppose live data has missing `expected_consumption_kwh`. How does prediction handle it?
-12. Suppose a meter has high night usage but belongs to a night-shift factory. How should the model avoid false positives?
-13. Suppose voltage is abnormal for an entire area. Is it theft or grid fault?
-14. Suppose pole tamper alerts are frequent after rain. What would you investigate?
-15. Suppose demand forecasting suddenly becomes inaccurate. What drift or data issues would you check?
-
-### 21.16 Questions You Should Be Ready To Answer Personally
-
-1. What was your exact contribution to this project?
-2. Which module was the most difficult to build and why?
-3. Why did you choose this project topic?
-4. What did you learn about smart grids?
-5. What did you learn about anomaly detection?
-6. What did you learn about full-stack ML systems?
-7. Which model performed best and how do you know?
-8. What would you improve if you had more time?
-9. What are the ethical concerns of electricity theft prediction?
-10. How would you make this project production-ready?
-11. How would you explain a false accusation risk to the interview panel?
-12. How would you collect real labels for theft?
-13. How would field-inspection feedback be added to the system?
-14. How would you convince an electricity board to trust this system?
-15. What is the strongest technical feature of your project?
-
-
-## 23. Roadmap improvements and evaluation tools
-
-This version includes additional leakage-aware evaluation scripts, dataset provenance checks, a chronological forecasting baseline benchmark, experimental privacy primitives, a durable single-host SQLite job queue utility, browser security middleware, and a dashboard decision-support notice. See [`docs/ROADMAP_IMPLEMENTATION.md`](docs/ROADMAP_IMPLEMENTATION.md) for exact capabilities and remaining production gates.
-
-### Evaluate a labeled theft dataset
-
-The project does not bundle a large labeled theft dataset. The public SGCC research benchmark is described at https://ieee-pes-data-sharing.org/datasets/detail/663b8e0e-3ace-48f8-b983-4cb59b39fa6f; check its license before use. It is China-origin, not Indian data. The CEEW Mathura/Bareilly dataset is real Indian consumption data but does not have verified theft labels. Dataset notes are in [`data/labels/README.md`](data/labels/README.md).
-
-```powershell
-python scripts/validate_theft_dataset.py --input data/labels/sgcc.csv --manifest data/labels/sgcc.provenance.json
-python scripts/evaluate_theft_models.py --input data/labels/sgcc.csv
-python scripts/evaluate_forecasting.py --input data/processed/ceew/daily_aggregate/your.normalized.csv.gz
-python scripts/check_model_compatibility.py
 python -m pytest -q
 ```
 
-The validation command checks structure and declared provenance; it cannot independently prove labels are true. The theft evaluation splits by customer and reports class-sensitive metrics. The forecasting benchmark uses chronological holdout data and compares simple baselines.
-#   T r u s t - F e d - G r i d - X 
- 
- #   T r u s t - F e d - G r i d - X 
- 
- 
+Useful focused evaluation scripts include:
 
-## Phase-II multi-client federated portal
-The latest update adds admin-managed client organizations, an independent client login/dashboard, a local client training agent, coordinator update verification, adaptive trust evidence, trust-weighted aggregation and a verifiable hash-chained audit log. Start with `docs/PHASE_II_MULTI_CLIENT_ARCHITECTURE.md` and `client_agent/README.md`. These are a Phase-II research baseline: the audit chain is not a distributed blockchain, secure aggregation and end-to-end DP are not enabled in the client-agent path, and production PostgreSQL/multi-worker deployment remains future work.
+```powershell
+python scripts/check_model_compatibility.py
+python scripts/evaluate_theft_models.py --help
+python scripts/evaluate_forecasting.py --help
+python scripts/run_robustness_suite.py --help
+```
 
+Consult each script's help for required inputs and output paths. Test success covers implemented code paths; it does not prove theft label validity, real-world model performance, production security, cryptographic security or privacy guarantees. Validation reports document which checks were actually run and their limitations.
 
-### Extended research components (2026-10-30)
-See `docs/EXTENDED_IMPLEMENTATION_AND_VALIDATION_2026-10-30.md` for the newly added SCAFFOLD, privacy-accounting, secure-sum reference, hash-linked ledger, drift/calibration and investigation-case components, along with explicit production limitations.
+## Limitations and security
 
+- Synthetic electricity readings and labels are used in the default end-to-end demo; they are not utility observations.
+- CEEW data is unlabeled for theft. No independently verified Indian theft-labeled dataset is bundled.
+- The live service, coordinator, and local databases are primarily single-process/local-development components.
+- Federated client updates are visible to the coordinator; secure aggregation and end-to-end differential privacy are not implemented on the client workflow.
+- Trust and poisoning scores are heuristic research signals and may penalize legitimate non-IID client behavior.
+- The local hash-linked audit log is not a distributed blockchain network. Fabric chaincode under `blockchain/fabric-chaincode/` is a separate artifact and is not evidence of an integrated Fabric deployment.
+- Browser controls and session checks do not replace security review, deployment hardening, TLS, CSRF defenses, centralized rate limiting, secret lifecycle management, backups or production monitoring.
+- Do not use model outputs alone to accuse a customer or take enforcement action. Require evidence and human review.
+- Do not commit `.env`, credentials, customer readings, dataset archives, client secrets or other private information.
 
-### Extended integration update
-See `docs/INTEGRATION_UPDATE_AND_REMAINING_WORK_2026-10-30.md` for the implementation status, deployment options, validation results and externally dependent items that remain.
+## Further documentation
+
+- [Architecture](docs/ARCHITECTURE.md) · [Method](docs/METHOD.md) · [Experiments](docs/EXPERIMENTS.md)
+- [Implementation status](docs/IMPLEMENTATION_STATUS.md) · [Known limitations](docs/KNOWN_LIMITATIONS.md) · [Privacy](docs/PRIVACY.md) · [Threat model](docs/THREAT_MODEL.md)
+- [Dataset sources](docs/DATASETS.md) · [Dataset card](docs/DATASET_CARD.md) · [Reproducibility](docs/REPRODUCIBILITY.md)
+- [Phase-II client architecture](docs/PHASE_II_MULTI_CLIENT_ARCHITECTURE.md) · [Trust validation results](docs/TRUST_VALIDATION.md)
+- [Windows setup details](run.md) · [Client agent instructions](client_agent/README.md)
 #   T r u s t - F e d - G r i d - X - U p d a t e d  
  
