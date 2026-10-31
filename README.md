@@ -365,5 +365,4 @@ Consult each script's help for required inputs and output paths. Test success co
 - [Dataset sources](docs/DATASETS.md) · [Dataset card](docs/DATASET_CARD.md) · [Reproducibility](docs/REPRODUCIBILITY.md)
 - [Phase-II client architecture](docs/PHASE_II_MULTI_CLIENT_ARCHITECTURE.md) · [Trust validation results](docs/TRUST_VALIDATION.md)
 - [Windows setup details](run.md) · [Client agent instructions](client_agent/README.md)
-#   T r u s t - F e d - G r i d - X - U p d a t e d  
- 
+#
